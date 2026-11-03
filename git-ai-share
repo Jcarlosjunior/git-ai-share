@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# git-ai-share: how much of a git history was co-authored by AI coding tools.
+#
+# It reads author, committer and Co-authored-by trailers from `git log` and
+# matches them against known signatures of AI tools. Run `git ai-share --help`.
+
+set -euo pipefail
+
+VERSION="0.1.0"
+
+# Built-in signatures, as "Tool=extended regex". They are matched, lowercased,
+# against "name <email>" of the author, the committer and every co-author.
+# Add your own with: git config --add aishare.tool 'Name=regex'
+BUILTIN_TOOLS='Claude=noreply@anthropic\.com|^claude\[bot\]
+Copilot=copilot@users\.noreply\.github\.com|^copilot-swe-agent\[bot\]
+Cursor=cursoragent@cursor\.com
+Aider=noreply@aider\.chat|\(aider\) <
+Devin=^devin-ai-integration\[bot\]
+Jules=^google-labs-jules\[bot\]'
+
+usage() {
+    cat <<'EOF'
+usage: git ai-share [--by tool|month|author] [--csv] [--include-merges]
+                    [<git log options>] [<revision range>] [[--] <path>...]
+
+Report the share of commits and changed lines that carry an AI tool's
+signature (author, committer or Co-authored-by trailer).
+
+  --by tool        one row per AI tool (default)
+  --by month       one row per month of author date
+  --by author      one row per commit author
+  --csv            print CSV instead of a table
+  --include-merges count merge commits too (skipped by default)
+  --tools          list the signatures in use and exit
+  -h, --help       show this help
+  --version        show the version
+
+Any other argument goes to `git log`, for example:
+  git ai-share --since=2026-01-01
+  git ai-share --by month v1.0..HEAD -- src/
+
+Add or override signatures with git config:
+  git config --add aishare.tool 'Codex=codex@openai\.com'
+EOF
+}
+
+by="tool"
+csv=0
+merges="--no-merges"
+list_tools=0
+log_args=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --by) by="${2:-}"; shift 2 ;;
+        --by=*) by="${1#--by=}"; shift ;;
+        --csv) csv=1; shift ;;
+        --include-merges) merges=""; shift ;;
+        --tools) list_tools=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        --version) echo "git-ai-share $VERSION"; exit 0 ;;
+        *) log_args+=("$1"); shift ;;
+    esac
+done
+
+case "$by" in
+    tool|month|author) ;;
+    *) echo "git-ai-share: --by must be tool, month or author" >&2; exit 2 ;;
+esac
+
+# User signatures come first, so a tool name set in git config replaces the
+# built-in one with the same name.
+user_tools=$(git config --get-all aishare.tool 2>/dev/null || true)
+tools=$(printf '%s\n%s\n' "$user_tools" "$BUILTIN_TOOLS" | awk -F= 'NF >= 2 && !seen[$1]++')
+
+if [ "$list_tools" = 1 ]; then
+    printf '%s\n' "$tools"
+    exit 0
+fi
+
+git rev-parse --git-dir >/dev/null
+
+# One header line per commit, marked with \036, then its --numstat lines.
+format='%x1eC%x1f%an <%ae>%x1f%cn <%ce>%x1f%ad%x1f%(trailers:key=Co-authored-by,valueonly,separator=%x1d)'
+
+# shellcheck disable=SC2086
+git log $merges --date=format:%Y-%m --numstat --format="$format" ${log_args[@]+"${log_args[@]}"} |
+AISHARE_TOOLS="$tools" AISHARE_BY="$by" AISHARE_CSV="$csv" awk '
+BEGIN {
+    ntools = split(ENVIRON["AISHARE_TOOLS"], lines, "\n")
+    nt = 0
+    for (i = 1; i <= ntools; i++) {
+        eq = index(lines[i], "=")
+        if (eq == 0) continue
+        nt++
+        tname[nt] = substr(lines[i], 1, eq - 1)
+        tre[nt] = substr(lines[i], eq + 1)
+    }
+    by = ENVIRON["AISHARE_BY"]
+    csv = ENVIRON["AISHARE_CSV"] + 0
+    have = 0
+}
+
+function flush(   k, ai, n, ids, j, key) {
+    if (!have) return
+    ai = 0
+    n = split(ident, ids, "\035")
+    for (k = 1; k <= nt; k++) {
+        for (j = 1; j <= n; j++) {
+            if (tolower(ids[j]) ~ tre[k]) {
+                tc[k]++; tl[k] += clines; ai = 1
+                break
+            }
+        }
+    }
+    key = (by == "month") ? month : (by == "author") ? author : ""
+    if (!(key in rc)) { nrows++; rowkey[nrows] = key; rc[key] = 0; ra[key] = 0; rl[key] = 0; ral[key] = 0 }
+    rc[key]++; rl[key] += clines
+    if (ai) { ra[key]++; ral[key] += clines; aic++; ail += clines }
+    total++; totl += clines
+    have = 0
+}
+
+substr($0, 1, 2) == "\036C" {
+    flush()
+    split(substr($0, 3), f, "\037")
+    author = f[2]
+    sub(/ <[^>]*>$/, "", author)
+    month = f[4]
+    # Author, committer and co-authors, separated by \035.
+    ident = f[2] "\035" f[3]
+    if (f[5] != "") ident = ident "\035" f[5]
+    clines = 0
+    have = 1
+    next
+}
+
+have && NF >= 3 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+    clines += $1 + $2
+}
+
+function pct(a, b) { return b ? sprintf("%.1f%%", 100 * a / b) : "-" }
+
+function sortrows(desc,   i, j, t, swap) {
+    for (i = 2; i <= nrows; i++) {
+        t = rowkey[i]
+        j = i - 1
+        while (j >= 1) {
+            if (desc) swap = (rc[rowkey[j]] < rc[t]) || (rc[rowkey[j]] == rc[t] && rowkey[j] > t)
+            else swap = rowkey[j] > t
+            if (!swap) break
+            rowkey[j + 1] = rowkey[j]
+            j--
+        }
+        rowkey[j + 1] = t
+    }
+}
+
+function csvq(s) { gsub(/"/, "\"\"", s); return "\"" s "\"" }
+
+END {
+    flush()
+    if (total == 0) { print "git-ai-share: no commits in range" > "/dev/stderr"; exit 1 }
+
+    if (by == "tool") {
+        # Tools that matched, most commits first.
+        m = 0
+        for (k = 1; k <= nt; k++) if (tc[k] > 0) { m++; ord[m] = k }
+        for (i = 2; i <= m; i++) {
+            t = ord[i]; j = i - 1
+            while (j >= 1 && (tc[ord[j]] < tc[t] || (tc[ord[j]] == tc[t] && tname[ord[j]] > tname[t]))) { ord[j + 1] = ord[j]; j-- }
+            ord[j + 1] = t
+        }
+        if (csv) {
+            print "tool,commits,commit_share,lines_changed,line_share"
+            for (i = 1; i <= m; i++) { k = ord[i]; printf "%s,%d,%.4f,%d,%.4f\n", csvq(tname[k]), tc[k], tc[k] / total, tl[k], totl ? tl[k] / totl : 0 }
+            printf "\"Any AI\",%d,%.4f,%d,%.4f\n", aic, aic / total, ail, totl ? ail / totl : 0
+            printf "\"No AI signature\",%d,%.4f,%d,%.4f\n", total - aic, (total - aic) / total, totl - ail, totl ? (totl - ail) / totl : 0
+            printf "\"Total\",%d,1,%d,1\n", total, totl
+        } else {
+            fmt = "%-16s %8s %7s %14s %7s\n"
+            printf fmt, "Tool", "Commits", "Share", "Lines changed", "Share"
+            for (i = 1; i <= m; i++) { k = ord[i]; printf fmt, tname[k], tc[k], pct(tc[k], total), tl[k], pct(tl[k], totl) }
+            if (m == 0) printf "%-16s\n", "(no AI signatures found)"
+            print "----------------------------------------------------------"
+            printf fmt, "Any AI", aic + 0, pct(aic, total), ail + 0, pct(ail, totl)
+            printf fmt, "No AI signature", total - aic, pct(total - aic, total), totl - ail, pct(totl - ail, totl)
+            printf "%-16s %8s %7s %14s\n", "Total", total, "", totl
+        }
+        exit 0
+    }
+
+    sortrows(by == "author")
+    label = (by == "month") ? "Month" : "Author"
+    if (csv) {
+        print tolower(label) ",commits,ai_commits,ai_commit_share,lines_changed,ai_lines_changed,ai_line_share"
+        for (i = 1; i <= nrows; i++) {
+            r = rowkey[i]
+            printf "%s,%d,%d,%.4f,%d,%d,%.4f\n", csvq(r), rc[r], ra[r], ra[r] / rc[r], rl[r], ral[r], rl[r] ? ral[r] / rl[r] : 0
+        }
+    } else {
+        fmt = "%-24s %8s %8s %7s %14s %7s\n"
+        printf fmt, label, "Commits", "AI", "Share", "Lines changed", "AI share"
+        for (i = 1; i <= nrows; i++) {
+            r = rowkey[i]
+            printf fmt, substr(r, 1, 24), rc[r], ra[r] + 0, pct(ra[r], rc[r]), rl[r], pct(ral[r], rl[r])
+        }
+        print "-------------------------------------------------------------------------"
+        printf fmt, "Total", total, aic + 0, pct(aic, total), totl, pct(ail, totl)
+    }
+}
+'
